@@ -68,23 +68,9 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 static const uint8_t OLED_WIDTH = OLED_DISPLAY_HEIGHT;
 static const uint16_t SPLASH_DURATION_MS = 2500;
 
-static const char PROGMEM QMK_LOGO_1[] = {
-    0x81, 0x82, 0x83, 0x84, 0x00
-};
-static const char PROGMEM QMK_LOGO_2[] = {
-    0xA1, 0xA2, 0xA3, 0xA4, 0x00
-};
-static const char PROGMEM QMK_LOGO_3[] = {
-    0xC1, 0xC2, 0xC3, 0xC4, 0x00
-};
-
 typedef struct {
     bool oled_on;
 } oled_state_m2s_t;
-
-typedef struct {
-    uint16_t keycode;
-} lastkey_m2s_t;
 
 typedef struct {
     uint32_t left;
@@ -98,7 +84,6 @@ static bool g_splash_active = true;
 static bool g_splash_rendered = false;
 static uint32_t g_splash_start_ms = 0;
 static uint32_t g_user_ontime = 0;
-static uint16_t g_last_keycode = KC_NO;
 static uint32_t g_press_left = 0;
 static uint32_t g_press_right = 0;
 static oled_state_m2s_t g_remote_oled_state = { false };
@@ -134,14 +119,75 @@ void oled_blit_24x24_P(const char *icon, uint8_t x, uint8_t page) {
     }
 }
 
-uint16_t unwrap_keycode(uint16_t kc) {
-    if (kc >= QK_MOD_TAP && kc <= QK_MOD_TAP_MAX) {
-        return QK_MOD_TAP_GET_TAP_KEYCODE(kc);
+void oled_blit_P(const char *img, uint8_t w, uint8_t pages, uint8_t x, uint8_t page) {
+    for (uint8_t p = 0; p < pages; p++) {
+        for (uint8_t i = 0; i < w; i++) {
+            oled_write_raw_byte(pgm_read_byte(&img[p * w + i]), (page + p) * OLED_WIDTH + x + i);
+        }
     }
-    if (kc >= QK_LAYER_TAP && kc <= QK_LAYER_TAP_MAX) {
-        return QK_LAYER_TAP_GET_TAP_KEYCODE(kc);
+}
+
+// WPM history bar chart: one bar per sample, scrolling left as new samples arrive
+#define WPM_HIST_LEN 32
+#define WPM_BAR_W 2
+#define WPM_CHART_PAGES 4
+#define WPM_CHART_H (WPM_CHART_PAGES * 8)
+#define WPM_SAMPLE_MS 2000
+#define WPM_MIN_SCALE 40
+static uint8_t g_wpm_hist[WPM_HIST_LEN];
+static uint32_t g_wpm_sample_ms = 0;
+
+void wpm_hist_update(void) {
+    if (timer_elapsed32(g_wpm_sample_ms) < WPM_SAMPLE_MS) {
+        return;
     }
-    return kc;
+    g_wpm_sample_ms = timer_read32();
+    memmove(g_wpm_hist, g_wpm_hist + 1, WPM_HIST_LEN - 1);
+    const uint8_t wpm = get_current_wpm();
+    g_wpm_hist[WPM_HIST_LEN - 1] = wpm;
+}
+
+void render_wpm_chart(uint8_t page) {
+    uint8_t scale = WPM_MIN_SCALE;
+    for (uint8_t i = 0; i < WPM_HIST_LEN; i++) {
+        if (g_wpm_hist[i] > scale) {
+            scale = g_wpm_hist[i];
+        }
+    }
+    for (uint8_t i = 0; i < WPM_HIST_LEN; i++) {
+        uint8_t h = (uint16_t)g_wpm_hist[i] * WPM_CHART_H / scale;
+        if (h < 1) {
+            h = 1; // baseline
+        }
+        const uint8_t start = WPM_CHART_H - h; // first filled row from the top
+        for (uint8_t p = 0; p < WPM_CHART_PAGES; p++) {
+            const uint8_t y0 = p * 8;
+            uint8_t mask;
+            if (start >= y0 + 8) {
+                mask = 0x00;
+            } else if (start <= y0) {
+                mask = 0xFF;
+            } else {
+                mask = (uint8_t)(0xFF << (start - y0));
+            }
+            for (uint8_t w = 0; w < WPM_BAR_W; w++) {
+                oled_write_raw_byte(mask, (page + p) * OLED_WIDTH + i * WPM_BAR_W + w);
+            }
+        }
+    }
+}
+
+void render_dog(uint8_t x, uint8_t page) {
+    const uint8_t wpm = get_current_wpm();
+    uint8_t frame;
+    if (wpm < 5) {
+        frame = (timer_read32() / 600u) & 1u;           // sit, tail wag / blink
+    } else if (wpm < 40) {
+        frame = 2 + ((timer_read32() / 250u) & 1u);     // walk
+    } else {
+        frame = 4 + ((timer_read32() / 120u) & 1u);     // run
+    }
+    oled_blit_P(DOG_FRAMES[frame], DOG_SPRITE_W, DOG_SPRITE_PAGES, x, page);
 }
 
 uint16_t get_current_dwpm(void) {
@@ -246,14 +292,6 @@ static void user_sync_oled_state_slave(uint8_t in_len, const void* in_data,
     }
 }
 
-static void user_sync_lastkey_slave(uint8_t in_len, const void* in_data,
-                                    uint8_t out_len, void* out_data) {
-    if (in_len >= sizeof(lastkey_m2s_t)) {
-        const lastkey_m2s_t* p = (const lastkey_m2s_t*)in_data;
-        g_last_keycode = p->keycode;
-    }
-}
-
 static void user_sync_presses_slave(uint8_t in_len, const void* in_data,
                                     uint8_t out_len, void* out_data) {
     if (in_len >= sizeof(presses_m2s_t)) {
@@ -268,7 +306,6 @@ void keyboard_post_init_user(void) {
     wait_ms(5);
 
     transaction_register_rpc(USER_SYNC_OLED_STATE, user_sync_oled_state_slave);
-    transaction_register_rpc(USER_SYNC_LASTKEY, user_sync_lastkey_slave);
     transaction_register_rpc(USER_SYNC_PRESSES, user_sync_presses_slave);
 
     if (!is_keyboard_master()) {
@@ -293,8 +330,6 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     g_user_ontime = timer_read32();
 
     if (record->event.pressed) {
-        g_last_keycode = keycode;
-
         uint8_t row = record->event.key.row;
         if (row < MATRIX_ROWS / 2) {
             g_press_left++;
@@ -303,9 +338,6 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         }
 
         if (is_keyboard_master()) {
-            lastkey_m2s_t keycode_pkt = { g_last_keycode };
-            (void)transaction_rpc_send(USER_SYNC_LASTKEY, sizeof(keycode_pkt), &keycode_pkt);
-
             presses_m2s_t presses_pkt = { g_press_left, g_press_right };
             (void)transaction_rpc_send(USER_SYNC_PRESSES, sizeof(presses_pkt), &presses_pkt);
         }
@@ -443,22 +475,13 @@ bool oled_task_user(void) {
         oled_write_P(PSTR("Left:"), false);
         print_balance(8, pct_left);
 
-        // Last key pressed
+        // WPM history
+        wpm_hist_update();
+        char wpm_buf[12];
+        snprintf(wpm_buf, sizeof(wpm_buf), "WPM %3u", get_current_wpm());
         oled_set_cursor(0, 10);
-        oled_write_P(PSTR("Last Key:"), false);
-        oled_set_cursor(0, 11);
-        const char *keycode_str = get_keycode_string(unwrap_keycode(g_last_keycode));
-        oled_print_right_aligned(keycode_str, g_oled_max_char);
-
-        // QMK logo
-        oled_set_cursor(0, 13);
-        oled_write_P(QMK_LOGO_1, false);
-        oled_set_cursor(0, 14);
-        oled_write_P(QMK_LOGO_2, false);
-        oled_set_cursor(0, 15);
-        oled_write_P(QMK_LOGO_3, false);
-        oled_set_cursor(7, 15);
-        oled_write_P(PSTR("QMK"), false);
+        oled_print_right_aligned(wpm_buf, g_oled_max_char);
+        render_wpm_chart(11);
     } else {
         // Uptime (only if oled is on)
         oled_set_cursor(0, 0);
@@ -477,10 +500,8 @@ bool oled_task_user(void) {
         oled_write_P(PSTR("Right:"), false);
         print_balance(8, pct_right);
 
-        // Keebart logo
-        oled_blit_24x24_P(KEEBART_BITMAP_24x24, 20, 11);
-        oled_set_cursor(2, 15);
-        oled_write_P(PSTR("KEEBART"), false);
+        // Dog
+        render_dog(8, 12);
     }
     return false;
 }
