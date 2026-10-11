@@ -68,9 +68,9 @@ void oled_blit_P(const char *img, uint8_t w, uint8_t pages, uint8_t x, uint8_t p
     }
 }
 
-// WPM history bar chart: one bar per sample, scrolling left as new samples arrive
+// WPM history line chart: one sample every WPM_SAMPLE_MS, scrolling left as new samples arrive
 #define WPM_HIST_LEN 32
-#define WPM_BAR_W 2
+#define WPM_BAR_W 2 // horizontal px per sample
 #define WPM_CHART_PAGES 4
 #define WPM_CHART_H (WPM_CHART_PAGES * 8)
 #define WPM_SAMPLE_MS 2000
@@ -88,6 +88,11 @@ void wpm_hist_update(void) {
     g_wpm_hist[WPM_HIST_LEN - 1] = wpm;
 }
 
+static int8_t wpm_chart_y(uint8_t wpm, uint8_t scale) {
+    // top row of the chart is y = 0, bottom row is WPM_CHART_H - 1
+    return (WPM_CHART_H - 1) - (int8_t)((uint16_t)wpm * (WPM_CHART_H - 1) / scale);
+}
+
 void render_wpm_chart(uint8_t page) {
     uint8_t scale = WPM_MIN_SCALE;
     for (uint8_t i = 0; i < WPM_HIST_LEN; i++) {
@@ -95,24 +100,38 @@ void render_wpm_chart(uint8_t page) {
             scale = g_wpm_hist[i];
         }
     }
-    for (uint8_t i = 0; i < WPM_HIST_LEN; i++) {
-        uint8_t h = (uint16_t)g_wpm_hist[i] * WPM_CHART_H / scale;
-        if (h < 1) {
-            h = 1; // baseline
+
+    // clear the chart area
+    for (uint8_t p = 0; p < WPM_CHART_PAGES; p++) {
+        for (uint8_t x = 0; x < OLED_WIDTH; x++) {
+            oled_write_raw_byte(0x00, (page + p) * OLED_WIDTH + x);
         }
-        const uint8_t start = WPM_CHART_H - h; // first filled row from the top
-        for (uint8_t p = 0; p < WPM_CHART_PAGES; p++) {
-            const uint8_t y0 = p * 8;
-            uint8_t mask;
-            if (start >= y0 + 8) {
-                mask = 0x00;
-            } else if (start <= y0) {
-                mask = 0xFF;
-            } else {
-                mask = (uint8_t)(0xFF << (start - y0));
+    }
+
+    // connect consecutive samples with 1 px lines (Bresenham)
+    const uint8_t y_off = page * 8;
+    for (uint8_t i = 0; i + 1 < WPM_HIST_LEN; i++) {
+        int16_t x0 = i * WPM_BAR_W;
+        int16_t x1 = (i + 1) * WPM_BAR_W;
+        int16_t y0 = wpm_chart_y(g_wpm_hist[i], scale);
+        int16_t y1 = wpm_chart_y(g_wpm_hist[i + 1], scale);
+        int16_t dx = x1 - x0;
+        int16_t dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+        int16_t sy = (y0 < y1) ? 1 : -1;
+        int16_t err = dx - dy;
+        while (true) {
+            oled_write_pixel(x0, y_off + y0, true);
+            if (x0 == x1 && y0 == y1) {
+                break;
             }
-            for (uint8_t w = 0; w < WPM_BAR_W; w++) {
-                oled_write_raw_byte(mask, (page + p) * OLED_WIDTH + i * WPM_BAR_W + w);
+            int16_t e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                x0++;
+            }
+            if (e2 < dx) {
+                err += dx;
+                y0 += sy;
             }
         }
     }
